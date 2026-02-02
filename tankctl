@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SOCK="${TANK_SOCK:-/tmp/freenove_tank.sock}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/freenove-tank"
+TOKEN_FILE="$STATE_DIR/lease.token"
+
+mkdir -p "$STATE_DIR"
+
+send_cmd() {
+  local cmd="$1"
+  python3 - <<'PY'
+import os, socket, sys
+sock_path = os.environ.get('SOCK')
+cmd = os.environ.get('CMD','').encode('utf-8') + b"\n"
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+    s.connect(sock_path)
+    s.sendall(cmd)
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+sys.stdout.write(data.decode('utf-8', errors='replace'))
+PY
+}
+
+get_token() {
+  if [[ -f "$TOKEN_FILE" ]]; then
+    cat "$TOKEN_FILE"
+  fi
+}
+
+# Default UX parameters (conservative)
+DEFAULT_MS=300
+DEFAULT_SPEED=0.25
+DEFAULT_MAX_SPEED=0.35
+D_MAX=1000
+TURN_RATIO=0.62
+DEFAULT_LEASE_TTL_MS=3000
+
+# Motion wrappers should require an explicit lease by default.
+# Set TANK_AUTO_LEASE=1 or pass --auto-lease to a wrapper to auto-acquire.
+ensure_lease() {
+  local token
+  token="$(get_token || true)"
+  if [[ -n "${token:-}" ]]; then
+    return 0
+  fi
+  if [[ "${AUTO_LEASE:-0}" != "1" && "${TANK_AUTO_LEASE:-0}" != "1" ]]; then
+    echo "ERR no_lease (run: tankctl lease)"
+    exit 2
+  fi
+
+  local out
+  out=$(SOCK="$SOCK" CMD="LEASE_ACQUIRE $DEFAULT_LEASE_TTL_MS" send_cmd "LEASE_ACQUIRE")
+  if [[ "$out" == OK* ]]; then
+    token=$(echo "$out" | awk '{print $2}')
+    echo "$token" > "$TOKEN_FILE"
+    return 0
+  fi
+  echo "$out"
+  exit 2
+}
+
+calc_duty() {
+  # Args: speed maxSpeed -> prints integer duty in [0..D_MAX]
+  python3 - <<'PY'
+import os
+speed=float(os.environ['SPEED'])
+maxSpeed=float(os.environ['MAXS'])
+D_MAX=int(os.environ['DMAX'])
+# clamp
+if speed < 0: speed = 0.0
+if speed > 1: speed = 1.0
+if maxSpeed < 0: maxSpeed = 0.0
+if maxSpeed > 1: maxSpeed = 1.0
+if speed > maxSpeed:
+    speed = maxSpeed
+print(int(round(speed * D_MAX)))
+PY
+}
+
+do_pulse() {
+  # Args: L R MS
+  local l="$1" r="$2" ms="$3"
+  ensure_lease
+  "$0" drive "$l" "$r" >/dev/null
+  python3 - <<PY
+import time
+time.sleep(${ms}/1000.0)
+PY
+  "$0" stop >/dev/null
+  echo "OK"
+}
+
+case "${1:-}" in
+  up)
+    systemctl --user start freenove-safe-drive.service
+    ;;
+  down)
+    systemctl --user stop freenove-safe-drive.service
+    ;;
+  status)
+    systemctl --user --no-pager status freenove-safe-drive.service || true
+    echo "---"
+    SOCK="$SOCK" CMD="STATUS" send_cmd "STATUS" || true
+    ;;
+  lease)
+    ttl_ms="${2:-10000}"
+    out=$(SOCK="$SOCK" CMD="LEASE_ACQUIRE $ttl_ms" send_cmd "LEASE_ACQUIRE")
+    echo "$out"
+    if [[ "$out" == OK* ]]; then
+      token=$(echo "$out" | awk '{print $2}')
+      echo "$token" > "$TOKEN_FILE"
+      echo "Saved token to $TOKEN_FILE"
+    fi
+    ;;
+  release)
+    token="$(get_token)"
+    if [[ -z "${token:-}" ]]; then echo "No token. Run: tankctl lease"; exit 2; fi
+    SOCK="$SOCK" CMD="LEASE_RELEASE $token" send_cmd "LEASE_RELEASE"
+    rm -f "$TOKEN_FILE"
+    ;;
+  drive)
+    token="$(get_token)"
+    if [[ -z "${token:-}" ]]; then echo "No token. Run: tankctl lease"; exit 2; fi
+    left="${2:-0}"; right="${3:-0}"
+    SOCK="$SOCK" CMD="DRIVE $token $left $right" send_cmd "DRIVE"
+    ;;
+  raw)
+    # raw pulse with explicit L/R and duration
+    ms="$DEFAULT_MS"; l="0"; r="0"
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --l) l="$2"; shift 2;;
+        --r) r="$2"; shift 2;;
+        --ms) ms="$2"; shift 2;;
+        *) echo "ERR invalid_args"; exit 2;;
+      esac
+    done
+    do_pulse "$l" "$r" "$ms"
+    ;;
+  fwd|back|spinl|spinr|left|right|arc|arc-gentle)
+    cmd="$1"
+    ms="$DEFAULT_MS"; speed="$DEFAULT_SPEED"; maxSpeed="$DEFAULT_MAX_SPEED"; leftS=""; rightS=""; AUTO_LEASE=0
+    shift
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --ms) ms="$2"; shift 2;;
+        --speed) speed="$2"; shift 2;;
+        --maxSpeed) maxSpeed="$2"; shift 2;;
+        --left) leftS="$2"; shift 2;;
+        --right) rightS="$2"; shift 2;;
+        --auto-lease) AUTO_LEASE=1; shift 1;;
+        *) echo "ERR invalid_args"; exit 2;;
+      esac
+    done
+
+    # compute base duty
+    duty=$(SPEED="$speed" MAXS="$maxSpeed" DMAX="$D_MAX" calc_duty)
+
+    case "$cmd" in
+      fwd)
+        do_pulse "$duty" "$duty" "$ms" ;;
+      back)
+        do_pulse "-$duty" "-$duty" "$ms" ;;
+      spinl)
+        do_pulse "-$duty" "$duty" "$ms" ;;
+      spinr)
+        do_pulse "$duty" "-$duty" "$ms" ;;
+      left)
+        r_duty=$(python3 - <<PY
+import math
+print(int(round(${duty}*${TURN_RATIO})))
+PY
+)
+        do_pulse "$duty" "$r_duty" "$ms" ;;
+      right)
+        l_duty=$(python3 - <<PY
+import math
+print(int(round(${duty}*${TURN_RATIO})))
+PY
+)
+        do_pulse "$l_duty" "$duty" "$ms" ;;
+      arc)
+        if [[ -z "${leftS:-}" || -z "${rightS:-}" ]]; then
+          echo "ERR invalid_args"; exit 2
+        fi
+        l_duty=$(SPEED="$leftS" MAXS="1" DMAX="$D_MAX" calc_duty)
+        r_duty=$(SPEED="$rightS" MAXS="1" DMAX="$D_MAX" calc_duty)
+        do_pulse "$l_duty" "$r_duty" "$ms" ;;
+      arc-gentle)
+        # based on 800/500 ratio, scaled by duty
+        l_duty="$duty"
+        r_duty=$(python3 - <<PY
+import math
+print(int(round(${duty}*${TURN_RATIO})))
+PY
+)
+        ms_default=350
+        if [[ "$ms" == "$DEFAULT_MS" ]]; then ms="$ms_default"; fi
+        do_pulse "$l_duty" "$r_duty" "$ms" ;;
+    esac
+    ;;
+  stop)
+    token="$(get_token)"
+    if [[ -z "${token:-}" ]]; then echo "No token. Run: tankctl lease"; exit 2; fi
+    SOCK="$SOCK" CMD="STOP $token" send_cmd "STOP"
+    ;;
+  estop)
+    SOCK="$SOCK" CMD="ESTOP" send_cmd "ESTOP"
+    ;;
+  clear-estop)
+    token="$(get_token)"
+    if [[ -z "${token:-}" ]]; then echo "No token. Run: tankctl lease"; exit 2; fi
+    SOCK="$SOCK" CMD="CLEAR_ESTOP $token" send_cmd "CLEAR_ESTOP"
+    ;;
+  *)
+    cat <<EOF
+Usage: tankctl <command> [args]
+
+Core:
+  up | down | status
+  lease [ttl_ms]            Acquire lease and save token locally
+  release                   Release lease (and stop)
+  drive <L> <R>             Raw drive wheels (-4095..4095)
+  stop                      Stop (requires lease)
+  estop                     Latch emergency stop (no lease required)
+  clear-estop               Clear E-stop (requires lease)
+
+UX wrappers (safe defaults):
+  fwd|back|spinl|spinr|left|right [--ms N] [--speed S] [--maxSpeed S]
+  arc --left S --right S [--ms N]
+  arc-gentle [--ms N] [--speed S]
+  raw --l L --r R [--ms N]
+
+Lease behavior:
+  Motion wrappers require an explicit `tankctl lease` by default.
+  Use --auto-lease (or env TANK_AUTO_LEASE=1) to auto-acquire a short lease.
+
+Defaults:
+  --ms=$DEFAULT_MS  --speed=$DEFAULT_SPEED  --maxSpeed=$DEFAULT_MAX_SPEED
+  D_MAX=$D_MAX  TURN_RATIO=$TURN_RATIO
+
+Env:
+  TANK_SOCK=/tmp/freenove_tank.sock
+EOF
+    exit 2
+    ;;
+esac
