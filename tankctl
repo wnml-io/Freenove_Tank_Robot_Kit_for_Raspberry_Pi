@@ -233,10 +233,10 @@ Core:
   clear-estop               Clear E-stop (requires lease)
 
 UX wrappers (safe defaults):
-  fwd|back|spinl|spinr|left|right [--ms N] [--speed S] [--maxSpeed S]
-  arc --left S --right S [--ms N]
-  arc-gentle [--ms N] [--speed S]
-  raw --l L --r R [--ms N]
+  fwd|back|spinl|spinr|left|right [--ms N] [--speed S] [--maxSpeed S] [--auto-lease]
+  arc --left S --right S [--ms N] [--auto-lease]
+  arc-gentle [--ms N] [--speed S] [--auto-lease]
+  raw --l L --r R [--ms N] [--auto-lease]
 
 Lease behavior:
   Motion wrappers require an explicit `tankctl lease` by default.
