@@ -1,0 +1,9 @@
+name: require-pr-template
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+jobs:
+  call:
+    uses: wnml-io/.github/.github/workflows/require-pr-template.yml@main
